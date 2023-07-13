@@ -1,0 +1,539 @@
+---
+title: "Motor Insurance Project"
+output: html_notebook
+---
+
+# Executive Summary
+
+Based on the data provided by a motor insurance broker, this report gives analysis on the renewal outcomes of 20,000 customers at the point of contract renewal. It is found that while demographics have no significant impacts on the renewal, other factors related to price and financial conditions of customers seem to have relatively significant relationship with the decision of "whether to renew" of customers.
+
+Focusing on price elasticity, this report discovered that customers exhibit price sensitivity in their insurance purchasing decisions, and **"*high premium and low discount rate*"** might be the reason customers opt to leave the company. Accordingly, the key pricing strategies are recommended as follow:
+
+-   Competitively lower premiums and discount rate should be offered for customers with budget-friendly cars to retain them.
+
+-   Higher premiums and discount rate can be applied for customers with high-end cars to maximise profitability.
+
+Finally, there are 3 models built to predict renewal decisions of customers, including Logistic Regression, Random Forest and XGBoost. After evaluating using Accuracy and AUC metrics, it is recommended that XGBoost is the best model for renewal classification.
+
+\newpage
+
+```{r,echo=FALSE,message=FALSE,warning=FALSE}
+# Load necessary packages
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggthemes)
+library(tidyverse)
+library(corrplot)
+library(table1)
+library(kableExtra)
+library(caret)
+library(pROC)
+library(ConfusionTableR)
+library(randomForest)
+library(tidymodels)
+library(finetune)
+library(xgboost)
+library(vip)
+library(vtreat)
+```
+
+# Introduction
+
+```{r data_staging}
+insurance <- read_excel("insurance_data_2023.xlsx") %>%
+  # Make variable names consistent
+  janitor::clean_names()
+```
+
+With the number of people driving a car increasing everyday, there has been a proliferation in the number of insurance contracts made by customers. The life cycle of renewing insurance policies is becoming necessary for any insurance company to manage. According to Global Data (2022), UK Insurance Consumer Survey found that 28.8% of insurance customers switched insurers at renewal. Therefore, it is crucial for insurance company to find out the reasons behind this phenomenon.
+
+Based on the data provided by a motor insurance broker, this report aims to analyse the factors which impact on renewal most and its pricing strategies. Finally, models are presented to predict insurance renewal decisions of customers and further recommendations are given.
+
+# Business understanding
+
+Based on the requirements from the insurance companies, this report aim to answer four questions as below:
+
+-   Which factors have the greatest effect on renewal rate?
+
+-   How does price relate to renewal rates?
+
+-   What are the key factors that affect customers' response to price increase?
+
+-   Recommendations on how to pricing to the customers?
+
+# Data understanding
+
+## Overview of the data
+
+The dataset contains information about the renewal outcomes of car insurance customers at the point where their annual contract is up for renewal. It consists of 20,000 customer records with their demographics, cars and its use, the relationship between customers and insurance brokers, the price of contract, and customer renewal or not.
+
+```{r}
+head(insurance)
+```
+
+## Data quality
+
+-   Missing data
+
+```{r}
+# Check for rows where data is missing
+insurance[!complete.cases(insurance), ]
+```
+
+It can be seen that there are 3 records having missing values in Price, Change in price vs Last year, and Grouped change in price.
+
+-   Duplicated data
+
+```{r}
+# Check for duplicated data
+nrow(insurance[duplicated(insurance),])
+```
+
+-   Outliers: We can see that price is skewed to the right
+
+```{r fig.height=3, fig.width=4}
+# Detect outliers in price
+ggplot(insurance, aes(price)) + 
+  geom_density()
+```
+
+# Data preparation
+
+In this phase, data is selected, cleaned and integrated so that they are fit for the analysis. Based on quality issues mentioned in the previous part, the data cleansing process:
+
+-   Remove unnecessary rows
+
+```{r}
+# Remove 3 records containing missing value
+# Remove records where gender is "C"
+insurance <- insurance %>%
+  filter(!is.na(price),
+         gender != "C")
+```
+
+-   Stage the factor variables
+
+```{r}
+# Renewal
+insurance$renewed <- factor(insurance$renewed,
+                            levels = c(0, 1),
+                            labels = c("No", "Yes"))
+
+# Marital status
+insurance <- insurance %>% 
+  mutate(new_marital_status = case_when(marital_status == "M" ~ "Maried",
+                                        TRUE ~ "Not Maried"),
+         new_marital_status = factor(new_marital_status, 
+                                     levels = c("Not Maried","Maried"), 
+                                     labels = c("Not Maried","Maried")))
+
+# Gender
+insurance$gender <- factor(insurance$gender, 
+                           levels = c("M", "F"), 
+                           labels = c("Male", "Female"))
+
+# Payment_method
+insurance$payment_method <- factor(insurance$payment_method)
+
+# Acquisition_channel
+insurance$acquisition_channel <- factor(insurance$acquisition_channel)
+```
+
+# Exploratory Data Analysis (EDA)
+
+According to the dataset, the number of customers who renewed contract accounts for about 62% (12,422 customers) of the total customers while there are only 38% of the customers opting to not extend the contract for another term.
+
+```{r}
+table(insurance$renewed)
+```
+
+## Renewal vs Demographic factors
+
+```{r}
+table1::label(insurance$new_marital_status) <- "Marital Status"
+table1::label(insurance$age) <- "Age"
+table1::label(insurance$gender) <- "Gender"
+table1::label(insurance$payment_method) <- "Payment Method"
+table1::label(insurance$acquisition_channel) <- "Acquisition Channel"
+table1::table1(~new_marital_status+age+gender+payment_method+ acquisition_channel|
+                 renewed, data=insurance)
+```
+
+-   Firstly, marital status has little effect on renewal decision as maried customers account for roughly 54% in both renewal and non-renewal. However, maried customers tend to renew their insurance rather than non-maried ones.
+
+-   Similarly, both male and female customers tend to have the same probability in renewing their insurance. Therefore, there is no clear relationship between renewal and gender.
+
+-   There is no considerable difference in the age of customers who opt for renewal or non-renewal. However, customers who are older tend to renew their insurance contract, with average of 45 years old.
+
+```{r fig.height=5, fig.width=8}
+# Renewed vs Payment method and Acquisition channel
+ggplot(insurance, aes(x=acquisition_channel, fill=renewed)) +
+  geom_bar(position="stack") + 
+  facet_wrap(~ payment_method) +
+  theme_bw() +
+  scale_fill_brewer(palette = "Pastel1") +
+  labs(title = "Renewal customers by Payment method and Acquisition channel",
+       x = "Acquisition Channel",
+       y = "Number of customers")
+```
+
+-   Customers are likely to choose to pay their insurance in a monthly basis. Additionally, these customers tend to renew their insurance rather than customers paying annually.
+
+-   Most customers reach the company by direct and inbound channels.
+
+```{r fig.height=3, fig.width=4}
+# Renewed vs car value
+insurance %>% 
+  filter(car_value < mean(car_value) + 3*sd(car_value)) %>%
+  ggplot(aes(x=renewed, y=car_value)) + geom_boxplot()
+```
+
+```{r fig.height=3, fig.width=4}
+# Inspect Renewed vs high car value
+insurance %>% 
+  filter(car_value > mean(car_value) + 3*sd(car_value)) %>%
+  ggplot(aes(x=renewed, y=car_value)) + geom_boxplot()
+```
+
+It can be seen that in the segment of customers who own cars under 20,000, they have tendency to leave the insurance, while customers owning higher car value would renew the insurance. This is also demonstrated by Miao et al. (2021) who state that with lower car value, customers are willing and able to buy a car at the same price rather than renewing the insurance.
+
+```{r}
+insurance %>%
+  ggplot(aes(y=factor(years_of_no_claims_bonus), fill=renewed)) +
+  geom_bar(position="fill") +
+  scale_x_continuous(n.break=10) +
+  theme_bw() + 
+  scale_fill_brewer(palette = "Pastel1") +
+  labs(title = "Percentage of renewal customers by Years of no-claim bonus",
+       x = "Percentage",
+       y = "Years of no-claim bonus")
+```
+
+It is notable that the customers with no year of no-claim bonus decided to not renew the insurance more than customers who renew the insurance, with only below 35% renewal customers. This demonstrates that no year of no-claim bonus would not attract customers to renew. Besides that, from 1 to 9 years of no-claim bonus, customers tend to renew their insurance, with about 65% of the customers chose to renew.
+
+## Renewal vs Price factors
+
+```{r}
+insurance %>%
+  ggplot(aes(x=price, fill=renewed)) +
+  geom_density(alpha=0.8) +
+  labs(title="Price distribution by Renewed") +
+  theme_bw() +
+  scale_fill_brewer(palette = "Pastel1")
+```
+
+It can be seen that there is a relationship between renewed and price. The lower price of insurance, the more likely that customers would renew their insurance policies. This can be explained that when the cost of insurance is affordable, customers are often inclined to continue their coverage. On the contrary, the number of non-renewal customers are higher than that of renewal customers when the insurance price is getting higher.
+
+```{r}
+insurance %>%
+  # first remove outliers
+  filter(percent_change_in_price_vs_last_year < 2,
+         percent_change_in_price_vs_last_year > -2) %>%
+  ggplot(aes(x=percent_change_in_price_vs_last_year, fill=renewed)) +
+  geom_density(alpha=0.4) +
+  labs(title="% change in Price distribution by Renewed") +
+  theme_bw() +
+  scale_fill_brewer(palette = "Pastel1")
+```
+
+From the chart, it is clear that customers renewing their insurance policies have lower change in price vs last year than that of non-renewal customers. This trend is relatively similar to the trend exhibited in the graph of price and renewed. This trend also indicates the relationship between percent change in price vs last year and renewal decision of customers.
+
+## Correlation between renewed and other variables
+
+-   **Chi-squared test** for relationship between 2 categorical variables
+
+```{r}
+chisq.test(insurance$renewed, insurance$gender)
+chisq.test(insurance$renewed, insurance$new_marital_status)
+chisq.test(insurance$renewed, insurance$payment_method)
+chisq.test(insurance$renewed, insurance$acquisition_channel)
+```
+
+There are significant differences between renewed and payment method (p-value \< 0.05)
+
+-   **T-test** for relationship between 1 categorical and 1 numerical variables
+
+```{r}
+t.test(insurance$age ~ insurance$renewed)
+t.test(insurance$car_value ~ insurance$renewed)
+t.test(insurance$annual_mileage ~ insurance$renewed)
+t.test(insurance$years_of_no_claims_bonus ~ insurance$renewed)
+t.test(insurance$price ~ insurance$renewed)
+t.test(insurance$percent_change_in_price_vs_last_year ~ insurance$renewed)
+```
+
+P-value are also below 0.05. Therefore, there are significant differences between Renewed and other variables including age, car value, annual mileage, years of no-claim bonus, price and percent change in price.
+
+-   **Correlation matrix** between price and other continuous variables
+
+```{r}
+price_cor <- insurance %>% 
+  select(price, 
+         actual_change_in_price_vs_last_year, 
+         percent_change_in_price_vs_last_year,
+         grouped_change_in_price,
+         age,
+         car_value,
+         annual_mileage,
+         years_of_no_claims_bonus) %>% 
+  cor() 
+colnames(price_cor) <- c("Price", "Actual change", "Pct change", "Group change", "Age", "Car value", "Annual mileage", "Year")
+rownames(price_cor) <- c("Price", "Actual change", "Pct change", "Group change", "Age", "Car value", "Annual mileage", "Year")
+corrplot(price_cor, method="color", type="lower", diag=F)
+```
+
+The relationship between price and other variables are relatively week, which are below 0.5. Notably, the relationships between price and age and year of no-claim bonus are negative. This indicates that younger people pay more for the insurance. And the higher price, the lower year of no-claim bonus.
+
+# Modeling and Evaluation
+
+In this phase, models are built to find pattern inside data and make future prediction for renewal decision of customers. Based on the EDA, seven factors are considered as explanatory variables for renew, including ***age, car_value, annual_mileage, years_of_no_claims_bonus, payment_method, price, percent_change_in_price_vs_last_year***.
+
+The models used in this report are Logistic Regression, Naive Bayes and Random Forest. Firstly, it is essential to perform cross-validation step, where the dataset is split into training dataset (80%) and test dataset (20%).
+
+```{r sampling}
+set.seed(2211)
+n_obs <- nrow(insurance)
+permuted_rows <- sample(n_obs)
+insurance_data_sample <- insurance[permuted_rows, ]
+threshold <- 0.8
+nrows_test <- round(threshold*n_obs)
+insurance_data_train <- insurance_data_sample[1:nrows_test, ]
+insurance_data_test <- insurance_data_sample[(nrows_test+1):nrow(insurance_data_sample), ]
+```
+
+## Logistic Regression
+
+Logistic Regression model is defined as statistical model which describes the relationship between a qualitative dependent variables and an independent variables (Nick and Campbell, 2007). The logistic regression model takes the natural logarithm of the odds as a regression function of the predictors.
+
+```{r}
+# Build the logistic model
+log_model <- glm(renewed ~ age + car_value + payment_method + annual_mileage + years_of_no_claims_bonus + price + percent_change_in_price_vs_last_year, data=insurance_data_train, family="binomial")
+
+broom::tidy(log_model)
+```
+
+```{r}
+# Predict the probability
+predicted_data_log <- predict(log_model, newdata=insurance_data_test, type="response")
+
+# Cross validation dataset
+cross_validation <- insurance_data_test
+cross_validation$predicted_log_model <- predicted_data_log
+
+cross_validation <- cross_validation %>%
+  mutate(predicted_log_model_class = ifelse(predicted_log_model > 0.5, "Yes", "No"),
+         predicted_log_model_class = factor(predicted_log_model_class,
+                                            levels = c("No", "Yes"),
+                                            labels = c("No", "Yes")))
+```
+
+```{r}
+confusionMatrix(table(cross_validation$predicted_log_model_class, cross_validation$renewed))
+```
+
+```{r}
+# Model performance using AUC and ROC
+model_auc <- pROC::auc(cross_validation$renewed, cross_validation$predicted_log_model)
+plot(pROC::roc(cross_validation$renewed, cross_validation$predicted_log_model),
+     auc.polygon = TRUE, 
+     print.auc = TRUE)
+```
+
+## Random Forest
+
+Random Forest is an ensemble-based learning algorithm which combines a series of tree classifiers to compute majority votes when making prediction. The method is built on the idea of bootstrap aggregation, which is a method for resampling with replacement to reduce variance. Random Forest can tolerate outliers and noisy data well, and avoid overfitting (Liu et al., 2012).
+
+```{r}
+# Build Random Forest model
+rf_model <- randomForest(renewed ~ age + car_value + annual_mileage + years_of_no_claims_bonus + payment_method + price + percent_change_in_price_vs_last_year, 
+                         data=insurance_data_train, 
+                         proximity = FALSE, 
+                         importance = FALSE, 
+                         ntree = 1000, 
+                         mtry = 2, 
+                         do.trace = FALSE, 
+                         tuneLength = 20)
+
+# Predict 
+predicted_data_rf <- predict(rf_model, newdata = insurance_data_test, type = "class")
+cross_validation$predicted_rf_model <- predicted_data_rf
+```
+
+```{r}
+# Model performance using Confusion Matrix
+confusionMatrix(table(cross_validation$predicted_rf_model, cross_validation$renewed))
+```
+
+```{r}
+plot(pROC::roc(cross_validation$renewed, as.numeric(cross_validation$predicted_rf_model)), auc.polygon = TRUE, print.auc = TRUE)
+```
+
+```{r}
+# Checking the most important variables
+varImpPlot(rf_model)
+```
+
+The higher the value of mean decrease accuracy or mean decrease gini score, the higher the importance of the variable to our model =\> price is the most important
+
+## XGBoost
+
+XGBoost, also known as eXtreme Gradient Boosting, is a supervised learning algorithm that implements a process called boosting to yield more accurate model (Mitchell and Frank, 2017). XGBoost is well-known for handling complex patterns and non-linear relationships.
+
+This report will build XGBoost using hyperparameter tuning. This helps to achieve optimal performance of the model. However, this process is computationally intensive.
+
+```{r}
+# Split train-test sets
+insurance_data_split <- insurance %>%
+  select("age", "car_value", "payment_method", "annual_mileage",  "years_of_no_claims_bonus", "price", "percent_change_in_price_vs_last_year", "renewed") %>%
+  initial_split(prop = 3/4, strata = renewed)
+
+train_data <- training(insurance_data_split)
+test_data  <- testing(insurance_data_split)
+```
+
+```{r}
+# Setup model specification
+xgb_spec <-boost_tree(
+  trees = tune(),
+  tree_depth = tune(), 
+  min_n = tune(),
+  loss_reduction = tune(),                    ## first three: model complexity
+  sample_size = tune(), mtry = tune(),        ## randomness
+  learn_rate = tune()                         ## step size
+) %>%
+  set_engine("xgboost", mode = "classification") %>%
+  set_mode("classification")
+xgb_spec
+```
+
+```{r}
+# Passing to workflow formula and Model specification
+xgb_wf <- workflow() %>%
+  add_formula(renewed ~ .) %>%
+  add_model(xgb_spec)
+xgb_wf
+```
+
+```{r}
+# Cross validation folds from training dataset
+set.seed(234)
+cv_fold <- vfold_cv(train_data, times = 10, apparent = TRUE, strata = "renewed")
+```
+
+```{r}
+# Grid search tunning
+set.seed(234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = cv_fold,
+  grid = 20,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+```
+
+```{r}
+# Show the best hypermeters based on AUC
+best_auc <- select_best (xgb_res, "roc_auc")
+best_auc
+```
+
+```{r}
+final_xgb <- finalize_workflow(
+  xgb_wf,
+  best_auc
+)
+
+final_xgb
+```
+
+```{r}
+# Fit final model to whole training dataset and evaluate on unseen testing data. The Performance metric as below
+final_res <- last_fit(final_xgb, 
+                      insurance_data_split)
+final_res %>%
+  collect_metrics()
+```
+
+```{r}
+final_res %>%
+  collect_predictions() %>%
+  conf_mat(renewed, .pred_class)
+```
+
+```{r}
+final_res %>%
+  collect_predictions() %>%
+  roc_curve(renewed, .pred_Yes, event_level="second") %>%
+  autoplot()
+```
+
+```{r}
+# Checking the most important variables
+final_res %>%
+  pluck(".workflow", 1) %>%
+  extract_fit_parsnip() %>%
+  vip(geom = "point")
+```
+
+## Models results and Evaluation
+
+To evaluate the models, AUC (Area Under ROC Curve) and Accuracy are taken into consideration. The 2 metrics of each model are summarised in the table below:
+
+| Model               | AUC   | Accuracy |
+|---------------------|-------|----------|
+| Logistic Regression | 0.663 | 0.674    |
+| Random Forest       | 0.613 | 0.669    |
+| XGBoost             | 0.686 | 0.680    |
+
+: Models evaluation
+
+Overall, three models represented have accuracy and AUC above 90, which indicates that they are all suitable for predicting renewal classification. However, XGBoost slightly outperforms Logistic Regression and Random Forest with both higher AUC and Accuracy at 0.686 and 68% respectively. Therefore, XGBoost is the best model to predict renewal decisions of customers.
+
+Based on the Logistic Regression model, it can be seen that renew has a negative relationship with 4 variables: price, percentage change in price, annual mileage, and years of no-claim bonus. On the other hand, there is a positive relationship between renew and 3 variables, including age, car value and payment method (monthly). These trends are clearly demonstrated in the EDA part.
+
+While Logistic Regression can not perform variable selection, Random Forest and XGBoost can provide feature importance, which allows to identify the most influential predictors in the models. The results show that among 7 variables, percentage change in price and price are the two most important factors affecting renewal. Following that are the value of the car and age of customers.
+
+# Recommendations
+
+1.  **Factors affecting renewal rates**
+
+The customer's renewal probability may be affected by many factors, which insurance companies should take into consideration. There are 7 main influencing factors, including age, car value, annual mileage, years of no-claim bonus, payment method, price, and percent change in price compared to last year. Therefore, it is recommended that company should focus on these characteristics to understand and retain customers.
+
+For example, customers with lower car value tend to leave the insurance. This phenomenon can be explained that since low value vehicles generally depreciate quickly, therefore, drivers are less motivated to renew their insurance contracts but rather buy the new one at the same price (Hsu et al., 2016, Miao et al., 2021).
+
+On the other hand, factors such as marital status, gender and acquisition channel has no differences between renewal and non-renewal customers. Hence, there demographics are not crucial factors in determining renewal.
+
+2.  **Pricing strategies**
+
+It is notable that discount rate (percentage change in price vs last year) has the greatest impact on renewal rate, followed by premium (price). Based on the analysis, the report concludes that **"*high premium and low discount rate*"** might be the reason customers opt to leave the company. They might be dissatisfied about the discount rate or premium, thereby not willing to extend their insurance (Daneshfar et al., 2016).
+
+Understanding the nature of price sensitivity at the individual policyholder level is extremely valuable for insurers (Guelman and Guillen, 2014). Based on the analysis and modeling, the reaction of customers toward the price shows that customers are price sentitive. When the premium is low and discount rate are high, customers are inclined to renew the contracts and vice versa. In other words, the demand of insurance is affected by price, therefore, insurance is price elastic.
+
+Nevertheless, the price elasticity is observed to be different between customers owning high value and low value cars. While renewal customers tend to possess high value vehicles, non-renewal customers would own low value ones. Combined with this idea, it is recommended that insurance company should be flexible in the pricing strategies for specific customer segments. Specifically, competitively lower premiums and discount rate should be offered for customers with budget-friendly cars to retain them. In contrast, higher premiums and discount rate can be applied for customers with high-end cars to maximise profitability.
+
+3.  **Model**
+
+The models represented in this report are all suitable to classify renewal decisions of customers, especially XGBoost with the highest accuracy and AUC. As a result, these models can be applied to predict renewal and non-renewal customers not only for the company but also the insurance industry in general.
+
+\newpage
+
+# References
+
+Daneshfar, Z., Roshani, A. and Sabzali, H. (2016). Evaluating customer retention and satisfaction and the reason of losing customers in the auto insurance (A case study). *Proceedings of the 2016 International Conference on Industrial Engineering and Operations Management*, 1-10.
+
+Global Data (2022) *UK motor insurance customers must switch more to combat sharp premium hikes, says GlobalData*. Available at: <https://www.globaldata.com/media/insurance/uk-motor-insurance-customers-must-switch-combat-sharp-premium-hikes-says-globaldata/> (Accessed: 11 May 2020).
+
+Guelman, L., and Guillén, M. (2014). A causal inference approach to measure price elasticity in automobile insurance. *Expert Systems with Applications*, 41(2), 387-396.
+
+Hsu, Y. C., Chou, P. L. and Shiu, Y. M. (2016). An examination of the relationship between vehicle insurance purchase and the frequency of accidents. *Asia Pacific management Review*, 21(4), 231-238.
+
+Liu, Y., Wang, Y. and Zhang, J. (2012). New machine learning algorithm: Random forest. *Information Computing and Applications: Third International Conference,* ICICA 2012, Chengde, China, September 14-16, 2012. Proceedings 3 (pp. 246-252). Springer Berlin Heidelberg.
+
+Miao, Y., Zhao, X., Zuo, J., Li, Z., Yan, Y., and Xie, J. (2021). Research on Renewal Probability Problem of Applying Clustering Method Under Big Data. *2021 IEEE International Conference on Consumer Electronics and Computer Engineering (ICCECE)*, 556-559.
+
+Mitchell, R., and Frank, E. (2017). Accelerating the XGBoost algorithm using GPU computing. *PeerJ Computer Science*, 3, e127.
+
+Nick, T. G. and Campbell, K. M. (2007). Logistic regression. *Topics in Biostatistics*, 273-301.
